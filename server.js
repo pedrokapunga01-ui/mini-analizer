@@ -7,19 +7,21 @@ const axios = require('axios');
 const PORT = process.env.PORT || 3001;
 const HOST = '0.0.0.0';
 
-// ========== FONTES DE DADOS ==========
-// Fonte 1: API da Evolution (pode ser bloqueada)
+// URL direta da Evolution (a que já usávamos)
 const EVOLUTION_URL = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
-// Fonte 2: API da TipMiner (fallback)
-// Nota: Este endpoint é um exemplo. Pode ser necessário ajustar o caminho exato.
-const TIPMINER_URL = 'https://api.tipminer.com/api/bacbo/results'; 
+// Proxies CORS públicos (o código tenta um a um até um funcionar)
+const PROXIES = [
+  (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
+];
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- Funções de Normalização (iguais às anteriores) ----------
+// ---------- Normalização ----------
 function stripAccents(str) {
   return String(str ?? '').normalize('NFD').split('').filter((c) => {
     const code = c.charCodeAt(0);
@@ -82,12 +84,13 @@ function normalizeRound(item) {
   return { id, resultado, t, pj, pb };
 }
 
-// ---------- Função para tentar uma fonte ----------
-async function fetchFromSource(url, sourceName) {
+// ---------- Tentar a Evolution através de um proxy ----------
+async function fetchViaProxy(proxyFn, sourceLabel) {
+  const proxiedUrl = proxyFn(EVOLUTION_URL);
   try {
-    const resp = await axios.get(url, {
-      timeout: 10000,
-      headers: { Accept: 'application/json', 'User-Agent': 'CapungaAnalyzer/1.0' }
+    const resp = await axios.get(proxiedUrl, {
+      timeout: 15000,
+      headers: { Accept: 'application/json', 'User-Agent': 'CapungaAnalyzer/3.0' }
     });
     const map = new Map();
     for (const it of extractItems(resp.data)) {
@@ -96,39 +99,45 @@ async function fetchFromSource(url, sourceName) {
     }
     const rounds = [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     if (rounds.length === 0) throw new Error('Resposta vazia');
-    console.log(`[OK] Fonte ${sourceName} devolveu ${rounds.length} rodadas.`);
+    console.log(`[OK] Fonte ${sourceLabel} devolveu ${rounds.length} rodadas.`);
     return rounds;
   } catch (e) {
-    console.warn(`[FALHA] Fonte ${sourceName}: ${e.message}`);
-    throw e; // Propaga o erro para o fallback
+    console.warn(`[FALHA] ${sourceLabel}: ${e.message}`);
+    throw e;
   }
 }
 
-// ---------- Rota principal com Fallback ----------
+// ---------- Rota principal com fallback entre proxies ----------
 app.get('/api/bacbo-results', async (req, res) => {
-  try {
-    // Tenta a Fonte 1 (Evolution)
+  for (let i = 0; i < PROXIES.length; i++) {
     try {
-      const rounds = await fetchFromSource(EVOLUTION_URL, 'Evolution');
-      return res.json({ ok: true, source: 'Evolution', count: rounds.length, data: rounds });
+      const rounds = await fetchViaProxy(PROXIES[i], `Proxy ${i + 1}`);
+      return res.json({ ok: true, source: `Proxy ${i + 1}`, count: rounds.length, data: rounds });
     } catch (e) {
-      console.log('Evolution falhou, a tentar TipMiner...');
+      // continua para o próximo proxy
     }
-
-    // Se falhar, tenta a Fonte 2 (TipMiner)
-    try {
-      const rounds = await fetchFromSource(TIPMINER_URL, 'TipMiner');
-      return res.json({ ok: true, source: 'TipMiner', count: rounds.length, data: rounds });
-    } catch (e) {
-      console.log('TipMiner também falhou.');
-    }
-
-    // Se ambas falharem, devolve erro
-    throw new Error('Todas as fontes de dados falharam.');
-  } catch (e) {
-    console.error('[ERRO FINAL]', e.message);
-    res.status(502).json({ ok: false, erro: 'Não foi possível obter dados de nenhuma fonte.', data: [] });
   }
+
+  // Se todos os proxies falharem, tenta a ligação direta (pode funcionar se o bloqueio for intermitente)
+  try {
+    const resp = await axios.get(EVOLUTION_URL, { timeout: 10000, headers: { Accept: 'application/json' } });
+    const map = new Map();
+    for (const it of extractItems(resp.data)) {
+      const rd = normalizeRound(it);
+      if (rd) map.set(rd.id, rd);
+    }
+    const rounds = [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+    if (rounds.length > 0) {
+      console.log(`[OK] Ligação direta devolveu ${rounds.length} rodadas.`);
+      return res.json({ ok: true, source: 'Direto', count: rounds.length, data: rounds });
+    }
+  } catch (e) {
+    console.warn(`[FALHA] Direto: ${e.message}`);
+  }
+
+  // Se tudo falhar, devolve erro
+  console.error('[ERRO FINAL] Todas as fontes e proxies falharam.');
+  res.status(502).json({ ok: false, erro: 'Não foi possível obter dados do Bac Bo.', data: [] });
 });
 
 // ---------- Health-check ----------
@@ -137,7 +146,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ servico: 'bacbo-mini-analyzer', endpoints: ['/api/bacbo-results', '/health'] });
+  res.json({ servico: 'bacbo-mini-analyzer', fontes: ['Evolution via proxy'], endpoints: ['/api/bacbo-results', '/health'] });
 });
 
 app.listen(PORT, HOST, () => {
