@@ -7,16 +7,19 @@ const axios = require('axios');
 const PORT = process.env.PORT || 3001;
 const HOST = '0.0.0.0';
 
-const EVOLUTION_URL =
-  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo' +
-  '?page=0&size=50&sort=data.settledAt,desc&duration=120' +
-  '&wheelResults=PlayerWon,BankerWon,Tie';
+// ========== FONTES DE DADOS ==========
+// Fonte 1: API da Evolution (pode ser bloqueada)
+const EVOLUTION_URL = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
+
+// Fonte 2: API da TipMiner (fallback)
+// Nota: Este endpoint é um exemplo. Pode ser necessário ajustar o caminho exato.
+const TIPMINER_URL = 'https://api.tipminer.com/api/bacbo/results'; 
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- Normalização ----------
+// ---------- Funções de Normalização (iguais às anteriores) ----------
 function stripAccents(str) {
   return String(str ?? '').normalize('NFD').split('').filter((c) => {
     const code = c.charCodeAt(0);
@@ -79,28 +82,52 @@ function normalizeRound(item) {
   return { id, resultado, t, pj, pb };
 }
 
-// ---------- Rota principal ----------
-app.get('/api/bacbo-results', async (req, res) => {
+// ---------- Função para tentar uma fonte ----------
+async function fetchFromSource(url, sourceName) {
   try {
-    const resp = await axios.get(EVOLUTION_URL, {
+    const resp = await axios.get(url, {
       timeout: 10000,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'CapungaAnalyzer/1.0'
-      }
+      headers: { Accept: 'application/json', 'User-Agent': 'CapungaAnalyzer/1.0' }
     });
-
     const map = new Map();
     for (const it of extractItems(resp.data)) {
       const rd = normalizeRound(it);
       if (rd) map.set(rd.id, rd);
     }
-
     const rounds = [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-    res.json({ ok: true, count: rounds.length, data: rounds });
+    if (rounds.length === 0) throw new Error('Resposta vazia');
+    console.log(`[OK] Fonte ${sourceName} devolveu ${rounds.length} rodadas.`);
+    return rounds;
   } catch (e) {
-    console.error('[ERRO]', e.message);
-    res.status(502).json({ ok: false, erro: e.message, data: [] });
+    console.warn(`[FALHA] Fonte ${sourceName}: ${e.message}`);
+    throw e; // Propaga o erro para o fallback
+  }
+}
+
+// ---------- Rota principal com Fallback ----------
+app.get('/api/bacbo-results', async (req, res) => {
+  try {
+    // Tenta a Fonte 1 (Evolution)
+    try {
+      const rounds = await fetchFromSource(EVOLUTION_URL, 'Evolution');
+      return res.json({ ok: true, source: 'Evolution', count: rounds.length, data: rounds });
+    } catch (e) {
+      console.log('Evolution falhou, a tentar TipMiner...');
+    }
+
+    // Se falhar, tenta a Fonte 2 (TipMiner)
+    try {
+      const rounds = await fetchFromSource(TIPMINER_URL, 'TipMiner');
+      return res.json({ ok: true, source: 'TipMiner', count: rounds.length, data: rounds });
+    } catch (e) {
+      console.log('TipMiner também falhou.');
+    }
+
+    // Se ambas falharem, devolve erro
+    throw new Error('Todas as fontes de dados falharam.');
+  } catch (e) {
+    console.error('[ERRO FINAL]', e.message);
+    res.status(502).json({ ok: false, erro: 'Não foi possível obter dados de nenhuma fonte.', data: [] });
   }
 });
 
